@@ -20,6 +20,25 @@ CREATE TABLE IF NOT EXISTS events (
     ts       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_user_ts ON events (user_id, kind, ts);
+CREATE TABLE IF NOT EXISTS expenses (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id   INTEGER NOT NULL,
+    category  TEXT    NOT NULL,
+    amount    REAL    NOT NULL,
+    note      TEXT    NOT NULL DEFAULT '',
+    ts        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_user_ts ON expenses (user_id, ts);
+CREATE TABLE IF NOT EXISTS diary (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id  INTEGER NOT NULL,
+    ts       INTEGER NOT NULL,
+    mood     INTEGER NOT NULL,           -- 1..5
+    trigger  TEXT    NOT NULL,           -- ключ из DIARY_TRIGGERS
+    note     TEXT    NOT NULL DEFAULT '',
+    smoked   INTEGER NOT NULL DEFAULT 0  -- сколько отмечено за день на момент записи
+);
+CREATE INDEX IF NOT EXISTS idx_diary_user_ts ON diary (user_id, ts);
 """
 
 # Колонки, добавленные позже: дописываются в существующую базу при запуске
@@ -133,8 +152,85 @@ class DB:
             (user_id, kind, limit),
         ).fetchall()
 
+    # ---------- траты ----------
+
+    def add_expense(self, user_id: int, category: str, amount: float, note: str = "") -> int:
+        with self.conn:
+            return self.conn.execute(
+                "INSERT INTO expenses (user_id, category, amount, note, ts) VALUES (?, ?, ?, ?, ?)",
+                (user_id, category, amount, note, int(time.time())),
+            ).lastrowid
+
+    def delete_expense(self, user_id: int, expense_id: int) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM expenses WHERE id = ? AND user_id = ?", (expense_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    def expense_sum(self, user_id: int, since: int = 0) -> float:
+        return self.conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses WHERE user_id = ? AND ts >= ?",
+            (user_id, since),
+        ).fetchone()[0]
+
+    def expense_by_category(self, user_id: int, since: int = 0):
+        return self.conn.execute(
+            """SELECT category, SUM(amount) AS total FROM expenses
+               WHERE user_id = ? AND ts >= ? GROUP BY category ORDER BY total DESC""",
+            (user_id, since),
+        ).fetchall()
+
+    def expense_times(self, user_id: int, category: str) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT ts FROM expenses WHERE user_id = ? AND category = ? ORDER BY ts",
+            (user_id, category),
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def first_expense_ts(self, user_id: int) -> int | None:
+        return self.conn.execute(
+            "SELECT MIN(ts) FROM expenses WHERE user_id = ?", (user_id,)
+        ).fetchone()[0]
+
+    def recent_expenses(self, user_id: int, limit: int = 10):
+        return self.conn.execute(
+            "SELECT id, category, amount, note, ts FROM expenses WHERE user_id = ? "
+            "ORDER BY ts DESC, id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+
+    # ---------- дневник ----------
+
+    def add_diary(self, user_id: int, mood: int, trigger: str, note: str, smoked: int) -> int:
+        with self.conn:
+            return self.conn.execute(
+                "INSERT INTO diary (user_id, ts, mood, trigger, note, smoked) VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, int(time.time()), mood, trigger, note, smoked),
+            ).lastrowid
+
+    def delete_diary(self, user_id: int, entry_id: int) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM diary WHERE id = ? AND user_id = ?", (entry_id, user_id)
+            )
+            return cur.rowcount > 0
+
+    def recent_diary(self, user_id: int, limit: int = 7):
+        return self.conn.execute(
+            "SELECT * FROM diary WHERE user_id = ? ORDER BY ts DESC, id DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+
+    def diary_all(self, user_id: int):
+        return self.conn.execute(
+            "SELECT * FROM diary WHERE user_id = ? ORDER BY ts", (user_id,)
+        ).fetchall()
+
     def reset(self, user_id: int):
         with self.conn:
+            self.conn.execute("DELETE FROM expenses WHERE user_id = ?", (user_id,))
+            self.conn.execute("DELETE FROM diary WHERE user_id = ?", (user_id,))
             self.conn.execute("DELETE FROM events WHERE user_id = ?", (user_id,))
             self.conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
 

@@ -6,8 +6,7 @@ import os
 import random
 import re
 import time
-from datetime import date, datetime, timedelta, timezone, tzinfo
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from datetime import date, datetime, timedelta, tzinfo
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -25,39 +24,41 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from .db import DB
+from . import extras
+from .core import (
+    BTN_CRAVING,
+    BTN_HEALTH,
+    BTN_LIMIT,
+    BTN_SETTINGS,
+    BTN_SMOKE,
+    BTN_STATS,
+    MAIN_KB,
+    TIMEZONES,
+    db,
+    day_start,
+    many,
+    money,
+    parse_number,
+    parse_tz,
+    tz_key,
+    tz_label,
+    u,
+    unit_price,
+    user_tz,
+)
 from .texts import (
     CURRENCIES,
     HEALTH_MILESTONES,
     HELP,
     PRODUCTS,
-    TIMEZONES,
     TIPS,
     duration,
     plural,
     product_forms,
-    units,
 )
 
-DEFAULT_TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Moscow"))
-db = DB(os.getenv("DB_PATH", "smoke_bot.sqlite3"))
 router = Router()
-
-BTN_SMOKE = "🚬 Закурил"
-BTN_CRAVING = "💪 Хочу курить"
-BTN_STATS = "📊 Статистика"
-BTN_HEALTH = "❤️ Здоровье"
-BTN_LIMIT = "🎯 Лимит"
-BTN_SETTINGS = "⚙️ Настройки"
-
-MAIN_KB = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_SMOKE), KeyboardButton(text=BTN_CRAVING)],
-        [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_HEALTH)],
-        [KeyboardButton(text=BTN_LIMIT), KeyboardButton(text=BTN_SETTINGS)],
-    ],
-    resize_keyboard=True,
-)
+fallback_router = Router()  # подключается последним: ловит всё, что не поймали остальные
 
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 MAX_PER_ENTRY = 20  # сколько штук можно отметить одним сообщением
@@ -73,6 +74,7 @@ class Setup(StatesGroup):
     per_day = State()
     pack_price = State()
     pack_size = State()
+    monthly = State()  # только для вейпа: вместо цены и размера пачки
 
 
 class LimitState(StatesGroup):
@@ -84,72 +86,6 @@ class EditState(StatesGroup):
 
 
 # ---------- вспомогательные функции ----------
-
-def parse_tz(name: str | None) -> tzinfo | None:
-    """Принимает имя пояса IANA (Europe/Moscow) или смещение (UTC+3, +5:30)."""
-    if not name:
-        return None
-    name = name.strip()
-    m = re.fullmatch(r"(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?", name, re.IGNORECASE)
-    if m:
-        hours, minutes = int(m[2]), int(m[3] or 0)
-        if hours > 14 or minutes >= 60:
-            return None
-        sign = 1 if m[1] == "+" else -1
-        label = f"UTC{m[1]}{hours}" + (f":{minutes:02d}" if minutes else "")
-        return timezone(sign * timedelta(hours=hours, minutes=minutes), label)
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
-        return None
-
-
-def tz_key(tz: tzinfo) -> str:
-    """Как сохранить часовой пояс в базе."""
-    return getattr(tz, "key", None) or tz.tzname(None)
-
-
-def user_tz(user) -> tzinfo:
-    return parse_tz(user["tz"]) or DEFAULT_TZ
-
-
-def tz_label(user) -> str:
-    key = tz_key(user_tz(user))
-    return next((title for title, k in TIMEZONES if k == key), key)
-
-
-def day_start(tz: tzinfo, days_ago: int = 0) -> int:
-    start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
-    start -= timedelta(days=days_ago)
-    # пересобираем дату, чтобы смещение было верным и при переходе на летнее время
-    return int(datetime(start.year, start.month, start.day, tzinfo=tz).timestamp())
-
-
-def parse_number(text: str | None) -> float | None:
-    try:
-        value = float((text or "").replace(",", ".").strip())
-    except ValueError:
-        return None
-    return value if value >= 0 else None
-
-
-def u(user, n: int) -> str:
-    """«3 сигареты» / «3 стика» — в зависимости от того, что курит человек."""
-    return units(n, user["product"])
-
-
-def many(user) -> str:
-    """«сигарет» / «стиков» — для вопросов «сколько …»."""
-    return product_forms(user["product"])[2]
-
-
-def unit_price(user) -> float:
-    return user["pack_price"] / user["pack_size"]
-
-
-def money(user, value: float) -> str:
-    return f"{value:,.0f} {user['currency']}".replace(",", " ")
-
 
 def best_streak(user, now: int) -> int:
     """Самый долгий промежуток без курения с момента начала."""
@@ -250,10 +186,14 @@ async def setup_product(message: Message, state: FSMContext):
         await message.answer("Выбери вариант кнопкой ниже 👇")
         return
     await state.update_data(product=product)
+    await ask_per_day(message, state, product)
+
+
+async def ask_per_day(message: Message, state: FSMContext, product: str, remove_keyboard: bool = True):
     await state.set_state(Setup.per_day)
     await message.answer(
-        f"Сколько {product_forms(product)[2]} в день ты обычно выкуриваешь? Напиши число.",
-        reply_markup=ReplyKeyboardRemove(),
+        PRODUCTS[product]["ask"],
+        reply_markup=ReplyKeyboardRemove() if remove_keyboard else None,
     )
 
 
@@ -263,9 +203,29 @@ async def setup_per_day(message: Message, state: FSMContext):
     if value is None or not 1 <= value <= 200 or value != int(value):
         await message.answer("Напиши целое число от 1 до 200, например: 15")
         return
-    await state.update_data(per_day=int(value))
+    data = await state.update_data(per_day=int(value))
+    if data["product"] == "vape":
+        await state.set_state(Setup.monthly)
+        await message.answer(
+            "Сколько ты в среднем тратишь в месяц на вейп: жидкости, испарители, устройства? "
+            "Напиши число."
+        )
+        return
     await state.set_state(Setup.pack_price)
     await message.answer("Сколько стоит одна пачка? Напиши число.")
+
+
+@router.message(Setup.monthly)
+async def setup_monthly(message: Message, state: FSMContext):
+    value = parse_number(message.text)
+    if value is None or not 1 <= value <= 10_000_000:
+        await message.answer("Напиши сумму числом, например: 3000")
+        return
+    data = await state.get_data()
+    await state.clear()
+    # у вейпа нет пачки: цена «штуки» = месячные траты / число подходов за месяц
+    db.save_user(message.from_user.id, "vape", data["per_day"], value / (data["per_day"] * 30), 1)
+    await finish_setup(message, db.get_user(message.from_user.id), per_month=value)
 
 
 @router.message(Setup.pack_price)
@@ -297,7 +257,10 @@ async def setup_pack_size(message: Message, state: FSMContext):
     uid = message.from_user.id
     db.save_user(uid, data["product"], data["per_day"], data["pack_price"], int(value))
     user = db.get_user(uid)
-    per_month = user["per_day"] * 30 * unit_price(user)
+    await finish_setup(message, user, per_month=user["per_day"] * 30 * unit_price(user))
+
+
+async def finish_setup(message: Message, user, per_month: float):
     await message.answer(
         "Готово! ✅\n\n"
         f"Сейчас ты тратишь на курение примерно <b>{money(user, per_month)}</b> в месяц "
@@ -308,6 +271,7 @@ async def setup_pack_size(message: Message, state: FSMContext):
         f"Когда тянет — жми «{BTN_CRAVING}», я помогу продержаться.\n\n"
         f"Часовой пояс: {tz_label(user)}, валюта: {user['currency']}. "
         f"Это и остальное меняется в «{BTN_SETTINGS}».\n\n"
+        "А ещё есть «📓 Дневник» (настроение и триггеры) и «💰 Траты» (записи покупок и калькулятор).\n\n"
         "Удачи, у тебя всё получится! 🚭",
         reply_markup=MAIN_KB,
     )
@@ -522,7 +486,7 @@ async def on_stats(message: Message, state: FSMContext):
         f"⏱ Без курения уже: <b>{duration(streak)}</b>",
         f"🏆 Лучшая серия: {duration(best_streak(user, now))}",
         "",
-        f"🚭 Не выкурено: <b>{u(user, int(avoided))}</b>",
+        f"🚭 Пропущено: <b>{u(user, int(avoided))}</b>",
         f"💰 Сэкономлено: <b>{money(user, saved)}</b>",
         f"💪 Побед над тягой: {cravings}",
         f"📅 В трекере: {duration(now - user['started_at'])}",
@@ -725,12 +689,24 @@ async def on_plan(callback: CallbackQuery):
 def settings_view(user) -> tuple[str, InlineKeyboardMarkup]:
     limit, _ = limit_info(user)
     product = PRODUCTS.get(user["product"], PRODUCTS["cig"])["title"]
+    vape = user["product"] == "vape"
+    cost_lines = (
+        f"Траты в месяц (оценка): {money(user, unit_price(user) * user['per_day'] * 30)}\n"
+        if vape else
+        f"Цена пачки: {money(user, user['pack_price'])}\n"
+        f"В пачке: {u(user, user['pack_size'])}\n"
+    )
+    cost_buttons = (
+        [InlineKeyboardButton(text="💵 Траты в месяц", callback_data="set:monthly")]
+        if vape else
+        [InlineKeyboardButton(text="💵 Цена пачки", callback_data="set:pack_price"),
+         InlineKeyboardButton(text="📦 Штук в пачке", callback_data="set:pack_size")]
+    )
     text = (
         "⚙️ <b>Настройки</b>\n\n"
         f"Что куришь: {product}\n"
         f"В день (до начала): {u(user, user['per_day'])}\n"
-        f"Цена пачки: {money(user, user['pack_price'])}\n"
-        f"В пачке: {u(user, user['pack_size'])}\n"
+        + cost_lines +
         f"Валюта: {user['currency']}\n"
         f"Часовой пояс: {tz_label(user)}\n"
         f"Дневной лимит: {u(user, limit) if limit is not None else 'не задан'}"
@@ -740,8 +716,7 @@ def settings_view(user) -> tuple[str, InlineKeyboardMarkup]:
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚬 Что куришь", callback_data="set:product"),
          InlineKeyboardButton(text="📈 Сколько в день", callback_data="set:per_day")],
-        [InlineKeyboardButton(text="💵 Цена пачки", callback_data="set:pack_price"),
-         InlineKeyboardButton(text="📦 Штук в пачке", callback_data="set:pack_size")],
+        cost_buttons,
         [InlineKeyboardButton(text="💱 Валюта", callback_data="set:currency"),
          InlineKeyboardButton(text="🕒 Часовой пояс", callback_data="set:tz")],
         [InlineKeyboardButton(text="🗑 Сбросить всё", callback_data="reset_ask")],
@@ -764,6 +739,7 @@ NUMBER_FIELDS = {
     "per_day": ("Сколько {many} в день ты курил до начала? Напиши число.", 1, 200, True),
     "pack_price": ("Сколько стоит пачка? Напиши число.", 1, 1_000_000, False),
     "pack_size": ("Сколько {many} в пачке?", 1, 100, True),
+    "monthly": ("Сколько в среднем тратишь в месяц на жидкости, испарители и устройства? Напиши число.", 1, 10_000_000, False),
 }
 
 
@@ -815,14 +791,22 @@ async def show_saved(message: Message, user_id: int, edit: bool = False):
 
 
 @router.callback_query(F.data.startswith("product:"))
-async def on_product(callback: CallbackQuery):
+async def on_product(callback: CallbackQuery, state: FSMContext):
     key = callback.data.split(":", 1)[1]
     if key not in PRODUCTS or not db.get_user(callback.from_user.id):
         await callback.answer()
         return
+    old = db.get_user(callback.from_user.id)["product"]
+    await callback.answer()
+    if (key == "vape") != (old == "vape"):
+        # у вейпа другие вопросы про цену, поэтому заново проходим короткую настройку
+        await state.clear()
+        await state.update_data(product=key)
+        await callback.message.edit_text("Для этого вида нужно уточнить пару данных.")
+        await ask_per_day(callback.message, state, key)
+        return
     db.update_user(callback.from_user.id, product=key)
     await show_saved(callback.message, callback.from_user.id, edit=True)
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("cur:"))
@@ -871,7 +855,18 @@ async def on_edit_value(message: Message, state: FSMContext):
         await state.clear()
         return
     await state.clear()
-    db.update_user(uid, **{field: value})
+    user = db.get_user(uid)
+    if user is None:
+        return
+    if field == "monthly":
+        fields = {"pack_price": value / (user["per_day"] * 30), "pack_size": 1}
+    elif field == "per_day" and user["product"] == "vape":
+        # месячные траты не меняются, пересчитываем цену одного подхода
+        monthly = unit_price(user) * user["per_day"] * 30
+        fields = {"per_day": value, "pack_price": monthly / (value * 30), "pack_size": 1}
+    else:
+        fields = {field: value}
+    db.update_user(uid, **fields)
     await show_saved(message, uid)
 
 
@@ -899,12 +894,12 @@ async def on_reset_yes(callback: CallbackQuery, state: FSMContext):
     await start_setup(callback.message, state)
 
 
-@router.callback_query()
+@fallback_router.callback_query()
 async def stale_callback(callback: CallbackQuery):
     await callback.answer("Эта кнопка устарела. Открой меню заново.")
 
 
-@router.message()
+@fallback_router.message()
 async def fallback(message: Message, state: FSMContext):
     if await require_user(message, state):
         await message.answer("Не понял 🤔 Воспользуйся кнопками ниже или /help.", reply_markup=MAIN_KB)
@@ -917,7 +912,9 @@ async def main():
         raise SystemExit("Укажи токен бота в переменной окружения BOT_TOKEN")
     bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
+    dp.include_router(extras.router)
     dp.include_router(router)
+    dp.include_router(fallback_router)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
