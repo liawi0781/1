@@ -223,7 +223,7 @@ async def setup_monthly(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     await state.clear()
-    # у вейпа нет пачки: цена «штуки» = месячные траты / число подходов за месяц
+    # у вейпа нет пачки: цена «штуки» = месячные траты / число затяжек за месяц
     db.save_user(message.from_user.id, "vape", data["per_day"], value / (data["per_day"] * 30), 1)
     await finish_setup(message, db.get_user(message.from_user.id), per_month=value)
 
@@ -285,7 +285,7 @@ async def cmd_help(message: Message, state: FSMContext):
     await message.answer(HELP, reply_markup=MAIN_KB)
 
 
-async def log_smoke(message: Message, user, n: int = 1, ts: int | None = None):
+async def log_smoke(message: Message, user, n: int = 1, ts: int | None = None, edit: bool = False):
     uid = user["user_id"]
     now = int(time.time())
     backdated = ts is not None
@@ -313,16 +313,23 @@ async def log_smoke(message: Message, user, n: int = 1, ts: int | None = None):
             lines.append("⚠️ Лимит на сегодня исчерпан.")
         else:
             lines.append(f"❗ Лимит ({limit}) превышен, лишних сегодня: {today - limit}. Не сдавайся, завтра новый день.")
-    lines.append(random.choice([
-        "Не ругай себя — главное, продолжать.",
-        "Попробуй отложить следующую хотя бы на 15 минут дольше.",
-        "Каждая пропущенная — это маленькая победа.",
-    ]))
+    if not edit:
+        lines.append(random.choice([
+            "Не ругай себя — главное, продолжать.",
+            "Попробуй отложить следующую хотя бы на 15 минут дольше.",
+            "Каждая пропущенная — это маленькая победа.",
+        ]))
 
+    # 1 нажатие = 1 штука: «+1» под сообщением обновляет счётчик на месте
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="↩️ Отменить", callback_data=f"undo:{first_id}:{last_id}")
+        InlineKeyboardButton(text=f"➕ +1 ({PRODUCTS[user['product'] or 'cig']['forms'][0]})", callback_data="plus"),
+        InlineKeyboardButton(text="↩️ Отменить", callback_data=f"undo:{first_id}:{last_id}"),
     ]])
-    await message.answer("\n".join(lines), reply_markup=kb)
+    text = "\n".join(lines)
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
 
 
 def parse_log(user, n_text: str | None, h_text: str | None, m_text: str | None):
@@ -379,6 +386,16 @@ async def on_log_text(message: Message, m: re.Match, state: FSMContext):
         await message.answer(result)
         return
     await log_smoke(message, user, *result)
+
+
+@router.callback_query(F.data == "plus")
+async def on_plus(callback: CallbackQuery):
+    user = db.get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала настрой бота: /start")
+        return
+    await log_smoke(callback.message, user, edit=True)
+    await callback.answer("+1")
 
 
 @router.callback_query(F.data.startswith("undo:"))
@@ -861,7 +878,7 @@ async def on_edit_value(message: Message, state: FSMContext):
     if field == "monthly":
         fields = {"pack_price": value / (user["per_day"] * 30), "pack_size": 1}
     elif field == "per_day" and user["product"] == "vape":
-        # месячные траты не меняются, пересчитываем цену одного подхода
+        # месячные траты не меняются, пересчитываем цену одной затяжки
         monthly = unit_price(user) * user["per_day"] * 30
         fields = {"per_day": value, "pack_price": monthly / (value * 30), "pack_size": 1}
     else:
